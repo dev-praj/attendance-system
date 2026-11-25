@@ -489,7 +489,7 @@ export function FaceEnrollmentPage() {
         <label className="field">Email <span className="muted">Optional</span><input className="input" type="email" disabled={active} value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} /></label>
         <label className="field">Consent note<input className="input" maxLength={1000} disabled={active} value={form.consent_note} onChange={(event) => setForm({ ...form, consent_note: event.target.value })} /></label>
         <label className="enrollment-consent"><input type="checkbox" required disabled={active} checked={consent} onChange={(event) => setConsent(event.target.checked)} /><span>The student has given consent for face data to be used for attendance. Consent time and recording teacher will be saved.</span></label>
-        <button className="button enrollment-start" disabled={active || !consent}>{active ? "Scan in progress" : "Start face scan"}</button>
+        <button className="button enrollment-start" disabled={active || !consent}>{active ? paused ? "Scan paused" : "Scan in progress" : "Start face scan"}</button>
         {active && <button type="button" className="button secondary enrollment-cancel" onClick={cancelScan}>Cancel scan</button>}
         {retryable && active && <button type="button" className="button enrollment-start" onClick={() => void retryScan()}>Retry scan</button>}
         <p className="enrollment-privacy">Only live camera frames are sent for processing. Photos and video are not saved.</p>
@@ -498,7 +498,7 @@ export function FaceEnrollmentPage() {
       <section className="enrollment-panel enrollment-stage" aria-label="Live face enrollment scan">
         <div className="enrollment-stage-head">
           <div><div className="enrollment-eyebrow">LIVE ENROLLMENT</div><h2>{targetLabel}</h2></div>
-          <span className={`enrollment-state ${active && !paused ? "is-live" : blocked ? "is-blocked" : ""}`}><i />{active && !paused ? "Camera on" : blocked ? "Verification required" : "Camera off"}</span>
+          <span className={`enrollment-state ${active && !paused ? "is-live" : blocked ? "is-blocked" : ""}`}><i />{active ? paused ? "Camera on · paused" : "Camera on" : "Camera off"}</span>
         </div>
         <div className="enrollment-camera-wrap">
           <video ref={videoRef} className="enrollment-video" playsInline muted aria-label="Mirrored live face camera preview" />
@@ -525,7 +525,7 @@ export function FaceEnrollmentPage() {
           const count = counts[pose] ?? 0;
           return <div key={pose} className={`enrollment-coverage ${count >= 3 ? "is-complete" : pose === targetPose && active ? "is-current" : ""}`}><span className="enrollment-coverage-mark">{count >= 3 ? "✓" : "·"}</span><span>{pose === "CENTER" ? "Center" : pose.replace("-", " · ")}</span><span>{count}/3</span></div>;
         })}</div>
-        <p className="enrollment-footnote">Keep your face inside the circle and follow each prompt. The camera stays on through retries; it closes after a verified scan or when you cancel. A clear, steady scan usually finishes within the one-minute target.</p>
+        <p className="enrollment-footnote">Keep your face inside the circle and follow each prompt. The camera stays on through retries; it closes after a verified scan or when you cancel. Aim for 60 seconds in clear light; timing varies with the camera, network, and pose movement.</p>
       </section>
     </div>
   </>;

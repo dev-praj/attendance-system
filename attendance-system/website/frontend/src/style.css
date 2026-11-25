@@ -111,6 +111,15 @@ tr:last-child td { border-bottom: 0; }
 .enrollment-coverage.is-complete { color: #a5f1c8; border-color: rgba(131, 232, 179, .2); background: rgba(67, 167, 117, .1); }
 .enrollment-coverage.is-complete .enrollment-coverage-mark { color: #83e8b3; }
 .enrollment-footnote { color: #8997ac; font-size: 10px; line-height: 1.6; margin: 15px 2px 0; }
+body.light .enrollment-panel { background: linear-gradient(145deg, rgba(255, 255, 255, .96), rgba(239, 243, 249, .98)); border-color: rgba(67, 82, 108, .14); box-shadow: 0 22px 60px rgba(42, 57, 81, .1), inset 0 1px #fff; }
+body.light .enrollment-eyebrow, body.light .enrollment-privacy, body.light .enrollment-footnote { color: #65738a; }
+body.light .enrollment-copy, body.light .enrollment-form .field, body.light .enrollment-consent { color: #4b5870; }
+body.light .enrollment-form .input, body.light .enrollment-prompt-row, body.light .enrollment-coverage { background: rgba(242, 246, 251, .85); border-color: rgba(79, 97, 125, .16); }
+body.light .enrollment-prompt-row p, body.light .enrollment-clock strong { color: #172035; }
+body.light .enrollment-coverage { color: #58667c; }
+body.light .enrollment-coverage.is-current { color: #172035; background: #eaf0f8; }
+body.light .enrollment-state { color: #58667c; background: rgba(242, 246, 251, .8); border-color: rgba(79, 97, 125, .16); }
+body.light .enrollment-clock small { color: #65738a; }
 @keyframes enrollment-live-pulse { 50% { opacity: .45; box-shadow: 0 0 4px rgba(101, 227, 162, .35); } }
 @keyframes enrollment-target-pulse { 50% { opacity: .38; } }
 .verification-frame { display: grid; gap: 4px; padding: 10px 0; border-bottom: 1px solid #293548; font-size: 13px; }
