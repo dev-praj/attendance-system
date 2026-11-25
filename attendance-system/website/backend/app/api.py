@@ -27,6 +27,7 @@ from .face.engine import engine
 from .face.matching import DEFAULT_THRESHOLD, decide_votes, frame_vote, score_embedding
 from .face.records import FaceVectorRecord
 from .face.store import face_store
+from .face import timing as face_timing
 from .settings import settings
 
 
@@ -1286,32 +1287,40 @@ def cancel_face_enrollment(session_id: str, request: Request,
 
 
 @router.post("/face/enrollments/{session_id}/frame")
+@face_timing.timed_frame_endpoint(1)
 def enrollment_frame(session_id: str, payload: schemas.EnrollmentFrameInput, request: Request,
                      user: models.Teacher = Depends(security.current_user), db: Session = Depends(get_db)):
     security.check_csrf(request)
     session = face_store.get_session(session_id)
     if session is None or session.teacher_id != user.id or session.completed:
+        face_timing.reject("session_missing")
         raise HTTPException(status_code=404, detail="Enrollment session not found.")
     expiry = session.expires_at
     if expiry.tzinfo is None:
         expiry = expiry.replace(tzinfo=timezone.utc)
     if expiry < datetime.now(timezone.utc):
+        face_timing.reject("session_expired")
         face_store.delete_session(session_id)
         db.commit()
         raise HTTPException(status_code=410, detail="Enrollment session expired.")
     try:
         import cv2
-        raw = base64.b64decode(payload.frame, validate=True)
-        frame = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+        with face_timing.measure("jpeg_decode"):
+            raw = base64.b64decode(payload.frame, validate=True)
+            frame = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
     except (ValueError, cv2.error) as error:
+        face_timing.reject("invalid_frame")
         raise HTTPException(status_code=422, detail="Frame must be a valid encoded image.") from error
     if frame is None:
+        face_timing.reject("invalid_frame")
         raise HTTPException(status_code=422, detail="Frame must be a valid encoded image.")
-    _ensure_face_engine()
+    with face_timing.measure("model_check_load"):
+        _ensure_face_engine()
     state = json.loads(session.state_json)
     now_epoch = datetime.now(timezone.utc).timestamp()
     attempt_started = float(state.setdefault("attempt_started_at", now_epoch))
     if now_epoch - attempt_started >= 55.0 and not is_complete(state):
+        face_timing.reject("attempt_timeout")
         state["attempt"] += 1
         state["stable_pose"] = None
         state["stable_count"] = 0
@@ -1328,8 +1337,10 @@ def enrollment_frame(session_id: str, payload: schemas.EnrollmentFrameInput, req
         db.commit()
         return {"status": "retry", "message": f"Missing: {', '.join(missing)}. Continuing attempt {state['attempt']} of 3.",
                 "counts": state["counts"], "attempt": state["attempt"]}
-    faces = engine.detect(frame)
+    with face_timing.measure("yunet_detection"):
+        faces = engine.detect(frame)
     if len(faces) != 1:
+        face_timing.reject("no_face" if not faces else "multiple_faces")
         state["stable_pose"] = None
         state["stable_count"] = 0
         session.state_json = json.dumps(state)
@@ -1346,8 +1357,10 @@ def enrollment_frame(session_id: str, payload: schemas.EnrollmentFrameInput, req
             1.0,
             float(np.median(sharpness_samples)) * {1: 0.4, 2: 0.3, 3: 0.2}[attempt],
         )
-    good, reason, sharpness = engine.quality(frame, face, score_gate, sharpness_floor)
+    with face_timing.measure("quality_checks"):
+        good, reason, sharpness = engine.quality(frame, face, score_gate, sharpness_floor)
     if not good:
+        face_timing.reject(reason if reason in face_timing.REJECTION_CODES else "invalid_pose")
         state["stable_pose"] = None
         state["stable_count"] = 0
         session.state_json = json.dumps(state)
@@ -1361,6 +1374,7 @@ def enrollment_frame(session_id: str, payload: schemas.EnrollmentFrameInput, req
     center = [float(face[0] + face[2] / 2), float(face[1] + face[3] / 2)]
     previous_center = state.get("previous_center")
     if previous_center and float(np.linalg.norm(np.asarray(center) - np.asarray(previous_center))) > float(face[2]) * 0.15:
+        face_timing.reject("moving")
         state["previous_center"] = center
         state["stable_pose"] = None
         state["stable_count"] = 0
@@ -1369,8 +1383,10 @@ def enrollment_frame(session_id: str, payload: schemas.EnrollmentFrameInput, req
         return {"status": "guiding", "message": "Hold still", "counts": state["counts"]}
     state["previous_center"] = center
     try:
-        yaw, pitch, _ = engine.estimate_pose(face, (frame.shape[1], frame.shape[0]))
+        with face_timing.measure("solvepnp_pose"):
+            yaw, pitch, _ = engine.estimate_pose(face, (frame.shape[1], frame.shape[0]))
     except (ValueError, cv2.error) as error:
+        face_timing.reject("invalid_pose")
         return {"status": "guiding", "message": str(error)[:120],
                 "counts": state["counts"]}
     calibration_started = float(state.setdefault("neutral_started_at", now_epoch))
@@ -1395,14 +1411,17 @@ def enrollment_frame(session_id: str, payload: schemas.EnrollmentFrameInput, req
     state["pose_history"] = state["pose_history"][-5:]
     smoothed = np.median(np.asarray(state["pose_history"]), axis=0)
     yaw, pitch = float(smoothed[0]), float(smoothed[1])
-    pose = classify_pose(yaw, pitch)
-    captured = observe(state, pose, True, now_epoch)
+    with face_timing.measure("pose_classification_gate"):
+        pose = classify_pose(yaw, pitch)
+        captured = observe(state, pose, True, now_epoch)
     if captured:
         try:
             # SFace alignment is the expensive part of the scan. Run it only
             # after the stable-pose gate has selected a frame for retention.
-            vector = engine.align_and_embed(frame, face)
+            with face_timing.measure("sface_embedding"):
+                vector = engine.align_and_embed(frame, face)
         except (ValueError, cv2.error) as error:
+            face_timing.reject("invalid_pose")
             state["counts"][pose] -= 1
             state["stable_pose"] = None
             state["stable_count"] = 0
@@ -1413,23 +1432,31 @@ def enrollment_frame(session_id: str, payload: schemas.EnrollmentFrameInput, req
         existing = face_store.list_session_embeddings(session_id, session.student_id, pose)
         for row in existing:
             if float(np.dot(vector, _decode_vector(row.encrypted_vector))) >= 0.95:
+                face_timing.reject("duplicate")
                 state["counts"][pose] -= 1
                 session.state_json = json.dumps(state)
                 db.commit()
                 return {"status": "guiding", "message": "Hold a slightly different pose",
                         "counts": state["counts"], "pose": pose, "yaw": yaw, "pitch": pitch}
+        with face_timing.measure("embedding_encrypt"):
+            encrypted_vector = _encrypt_vector(vector)
         face_store.add_session_embedding(session_id, FaceVectorRecord(
             id=str(uuid.uuid4()),
             student_id=session.student_id,
             enrollment_session_id=session_id,
             pose=pose,
-            encrypted_vector=_encrypt_vector(vector),
+            encrypted_vector=encrypted_vector,
             model_version="sface_2021dec",
             quality=float(face[14]),
             yaw=yaw,
             pitch=pitch,
             created_at=datetime.now(timezone.utc),
         ))
+        face_timing.accepted(pose)
+    elif pose is None:
+        face_timing.reject("invalid_pose")
+    else:
+        face_timing.reject("stable_wait")
     session.state_json = json.dumps(state)
     completed = is_complete(state)
     message = "Checking..." if completed else _prompt(state)
@@ -1458,16 +1485,19 @@ def _prompt(state):
 
 
 @router.post("/face/enrollments/{session_id}/self-test")
+@face_timing.timed_frame_endpoint(2)
 def enrollment_self_test(session_id: str, payload: schemas.EnrollmentFrameInput, request: Request,
                          user: models.Teacher = Depends(security.current_user), db: Session = Depends(get_db)):
     security.check_csrf(request)
     session = face_store.get_session(session_id)
     if session is None or session.teacher_id != user.id or session.completed:
+        face_timing.reject("session_missing")
         raise HTTPException(status_code=404, detail="Enrollment session not found.")
     expiry = session.expires_at
     if expiry.tzinfo is None:
         expiry = expiry.replace(tzinfo=timezone.utc)
     if expiry < datetime.now(timezone.utc):
+        face_timing.reject("session_expired")
         face_store.delete_session(session_id)
         db.commit()
         raise HTTPException(status_code=410, detail="Enrollment session expired.")
@@ -1477,34 +1507,46 @@ def enrollment_self_test(session_id: str, payload: schemas.EnrollmentFrameInput,
     encoded_vectors = state.setdefault("self_test_vectors", [])
     try:
         import cv2
-        frame = cv2.imdecode(np.frombuffer(base64.b64decode(payload.frame, validate=True), np.uint8), cv2.IMREAD_COLOR)
+        with face_timing.measure("jpeg_decode"):
+            frame = cv2.imdecode(np.frombuffer(base64.b64decode(payload.frame, validate=True), np.uint8), cv2.IMREAD_COLOR)
     except (ValueError, cv2.error) as error:
+        face_timing.reject("invalid_frame")
         raise HTTPException(status_code=422, detail="Frame must be a valid encoded image.") from error
     if frame is None:
+        face_timing.reject("invalid_frame")
         raise HTTPException(status_code=422, detail="Frame must be a valid encoded image.")
-    _ensure_face_engine()
-    faces = engine.detect(frame)
+    with face_timing.measure("model_check_load"):
+        _ensure_face_engine()
+    with face_timing.measure("yunet_detection"):
+        faces = engine.detect(frame)
     if len(faces) != 1:
+        face_timing.reject("no_face" if not faces else "multiple_faces")
         return {"status": "checking", "message": "Look straight at the camera",
                 "self_test_frames": len(encoded_vectors)}
     face = faces[0]
-    good, _, _ = engine.quality(frame, face)
+    with face_timing.measure("quality_checks"):
+        good, quality_reason, _ = engine.quality(frame, face)
     if not good:
+        face_timing.reject("self_test_quality" if quality_reason not in face_timing.REJECTION_CODES else quality_reason)
         return {"status": "checking", "message": "Hold still in the center",
                 "self_test_frames": len(encoded_vectors)}
-    yaw, pitch, _ = engine.estimate_pose(face, (frame.shape[1], frame.shape[0]))
+    with face_timing.measure("solvepnp_pose"):
+        yaw, pitch, _ = engine.estimate_pose(face, (frame.shape[1], frame.shape[0]))
     neutral = state.get("neutral_offset")
     if neutral:
         yaw = (yaw - neutral[0] + 180) % 360 - 180
         pitch -= neutral[1]
     if abs(yaw) > 8 or abs(pitch) > 8:
+        face_timing.reject("self_test_not_centered")
         state["self_test_vectors"] = []
         session.state_json = json.dumps(state)
         db.commit()
         return {"status": "checking", "message": "Look straight at the camera", "self_test_frames": 0}
-    vector = engine.align_and_embed(frame, face)
+    with face_timing.measure("sface_embedding"):
+        vector = engine.align_and_embed(frame, face)
     if len(encoded_vectors) < 5:
-        encoded_vectors.append(_encode_transient_vector(vector))
+        with face_timing.measure("self_test_embedding_encrypt"):
+            encoded_vectors.append(_encode_transient_vector(vector))
         session.state_json = json.dumps(state)
         db.commit()
     vectors = [_decode_transient_vector(value) for value in encoded_vectors]
@@ -1514,7 +1556,8 @@ def enrollment_self_test(session_id: str, payload: schemas.EnrollmentFrameInput,
     vectors_by_pose = {}
     for row in stored:
         vectors_by_pose.setdefault(row.pose, []).append(_decode_vector(row.encrypted_vector))
-    cohesion_ok, filtered, cohesion, reason = verify_embedding_quality(vectors_by_pose)
+    with face_timing.measure("embedding_consistency"):
+        cohesion_ok, filtered, cohesion, reason = verify_embedding_quality(vectors_by_pose)
     if cohesion_ok:
         retained_rows = _retained_embedding_rows(stored, filtered)
         yaw_values = [row.yaw for row in retained_rows if row.yaw is not None]
@@ -1527,6 +1570,7 @@ def enrollment_self_test(session_id: str, payload: schemas.EnrollmentFrameInput,
         if pitch_range < 20:
             missing_range_poses.extend(("UP", "DOWN"))
         if missing_range_poses:
+            face_timing.reject("invalid_pose")
             state["attempt"] += 1
             state["self_test_vectors"] = []
             if state["attempt"] > 3:
@@ -1562,6 +1606,7 @@ def enrollment_self_test(session_id: str, payload: schemas.EnrollmentFrameInput,
     norm = float(np.linalg.norm(probe))
     score = float(np.max(np.asarray(enrolled) @ (probe / norm))) if norm and enrolled else 0.0
     if not cohesion_ok or score < 0.5:
+        face_timing.reject("self_test_similarity")
         state["self_test_vectors"] = []
         state["self_test_failures"] += 1
         state["attempt"] += 1
@@ -1590,30 +1635,32 @@ def enrollment_self_test(session_id: str, payload: schemas.EnrollmentFrameInput,
                 "reason": reason or "Live self-test did not match.", "score": round(score, 4),
                 "counts": state["counts"]}
     # Refuse to attach a fresh enrollment to a face that strongly matches another student.
-    for existing_student in db.query(models.Student).filter(
-        models.Student.active.is_(True),
-        models.Student.id != session.student_id,
-        models.Student.consent_given_at.is_not(None),
-    ).all():
-        existing_vectors = face_store.list_templates(existing_student.id)
-        if not existing_vectors:
-            continue
-        best_score = max(
-            float(np.dot(vector, _decode_vector(row.encrypted_vector)))
-            for vector in enrolled for row in existing_vectors
-        )
-        if best_score >= 0.65:
-            face_store.delete_session(session_id)
-            _audit(request, db, user, "face_duplicate_blocked", entity_type="student",
-                   entity_id=session.student_id,
-                   detail=f"possible duplicate student_id={existing_student.id}; score={best_score:.3f}")
-            db.commit()
-            return {
-                "status": "blocked",
-                "message": "Face data strongly matches another registered student.",
-                "possible_match": {"name": existing_student.name, "roll_no": existing_student.roll_no},
-                "score": round(best_score, 4),
-            }
+    with face_timing.measure("duplicate_identity_check"):
+        for existing_student in db.query(models.Student).filter(
+            models.Student.active.is_(True),
+            models.Student.id != session.student_id,
+            models.Student.consent_given_at.is_not(None),
+        ).all():
+            existing_vectors = face_store.list_templates(existing_student.id)
+            if not existing_vectors:
+                continue
+            best_score = max(
+                float(np.dot(vector, _decode_vector(row.encrypted_vector)))
+                for vector in enrolled for row in existing_vectors
+            )
+            if best_score >= 0.65:
+                face_timing.reject("duplicate_identity")
+                face_store.delete_session(session_id)
+                _audit(request, db, user, "face_duplicate_blocked", entity_type="student",
+                       entity_id=session.student_id,
+                       detail=f"possible duplicate student_id={existing_student.id}; score={best_score:.3f}")
+                db.commit()
+                return {
+                    "status": "blocked",
+                    "message": "Face data strongly matches another registered student.",
+                    "possible_match": {"name": existing_student.name, "roll_no": existing_student.roll_no},
+                    "score": round(best_score, 4),
+                }
     pose_ranges = {}
     for pose in state["counts"]:
         pose_rows = [row for row in retained_rows if row.pose == pose]

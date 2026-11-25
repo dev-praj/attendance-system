@@ -38,6 +38,7 @@ type SettingsData = {
 };
 const colors = ["#6ee7a7", "#f7c96a", "#f17c87", "#7d8aa3"];
 const REQUIRED_POSES = ["CENTER", "LEFT", "RIGHT", "UP", "DOWN", "UP-LEFT", "UP-RIGHT", "DOWN-LEFT", "DOWN-RIGHT"];
+const FACE_ENROLLMENT_TIMING = import.meta.env.DEV && import.meta.env.VITE_FACE_ENROLLMENT_TIMING === "1";
 
 function PageHead({ title, description, action }: { title: string; description: string; action?: ReactNode }) {
   return <div className="page-head"><div><div className="eyebrow">Teacher workspace</div><h1>{title}</h1><div className="muted">{description}</div></div>{action}</div>;
@@ -320,6 +321,9 @@ export function FaceEnrollmentPage() {
     let inFlight = false;
     let consecutiveErrors = 0;
     let nextFrameAt = 0;
+    let frameNumber = 0;
+    let lastFrameAt = 0;
+    let skippedInFlight = 0;
     let timer: number | undefined;
     let elapsedTimer: number | undefined;
     const start = async () => {
@@ -334,10 +338,15 @@ export function FaceEnrollmentPage() {
         streamRef.current = stream;
         if (videoRef.current) { videoRef.current.srcObject = stream; await videoRef.current.play(); }
         timer = window.setInterval(() => {
-          if (!running || pausedRef.current || !sessionIdRef.current || inFlight ||
+          if (!running || pausedRef.current || !sessionIdRef.current ||
               Date.now() < nextFrameAt || !videoRef.current || !canvasRef.current ||
               videoRef.current.readyState < 2) return;
+          if (inFlight) { skippedInFlight += 1; return; }
           inFlight = true;
+          const captureAt = performance.now();
+          const frameIntervalMs = lastFrameAt ? captureAt - lastFrameAt : 0;
+          lastFrameAt = captureAt;
+          frameNumber += 1;
           const video = videoRef.current;
           const canvas = canvasRef.current;
           canvas.width = 640; canvas.height = Math.round(640 * video.videoHeight / Math.max(1, video.videoWidth));
@@ -345,7 +354,10 @@ export function FaceEnrollmentPage() {
           if (!context) { inFlight = false; setError("Browser canvas is unavailable."); return; }
           // Preview mirroring is CSS only; detection always receives this original, unmirrored frame.
           context.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const encodeStartedAt = performance.now();
           const frame = canvas.toDataURL("image/jpeg", 0.72).split(",")[1];
+          const jpegEncodeMs = performance.now() - encodeStartedAt;
+          const requestStartedAt = performance.now();
           const requestSessionId = sessionIdRef.current;
           const endpoint = coverageDoneRef.current
             ? `/face/enrollments/${requestSessionId}/self-test`
@@ -356,6 +368,16 @@ export function FaceEnrollmentPage() {
             endpoint, { method: "POST", body: JSON.stringify({ frame }), signal: controller.signal },
           ).then((result) => {
             if (!running) return;
+            if (FACE_ENROLLMENT_TIMING) {
+              console.info("face_enrollment_frontend_timing", JSON.stringify({
+                frame: frameNumber,
+                frame_interval_ms: Number(frameIntervalMs.toFixed(3)),
+                jpeg_encode_ms: Number(jpegEncodeMs.toFixed(3)),
+                request_round_trip_ms: Number((performance.now() - requestStartedAt).toFixed(3)),
+                skipped_in_flight: skippedInFlight,
+              }));
+              skippedInFlight = 0;
+            }
             consecutiveErrors = 0;
             nextFrameAt = Date.now();
             setError("");
@@ -398,6 +420,17 @@ export function FaceEnrollmentPage() {
             }
           }).catch((reason: unknown) => {
             if (!running) return;
+            if (FACE_ENROLLMENT_TIMING) {
+              console.info("face_enrollment_frontend_timing", JSON.stringify({
+                frame: frameNumber,
+                frame_interval_ms: Number(frameIntervalMs.toFixed(3)),
+                jpeg_encode_ms: Number(jpegEncodeMs.toFixed(3)),
+                request_round_trip_ms: Number((performance.now() - requestStartedAt).toFixed(3)),
+                skipped_in_flight: skippedInFlight,
+                failed: 1,
+              }));
+              skippedInFlight = 0;
+            }
             consecutiveErrors += 1;
             nextFrameAt = Date.now() + Math.min(250 * (2 ** Math.min(consecutiveErrors - 1, 4)), 4000);
             const detail = reason instanceof Error ? reason.message : "Enrollment frame failed.";

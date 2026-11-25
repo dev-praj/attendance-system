@@ -13,6 +13,7 @@ import numpy as np
 from cryptography.fernet import Fernet, InvalidToken
 
 from ..settings import BACKEND_DIR, settings
+from . import timing
 
 
 class FaceStore:
@@ -40,7 +41,8 @@ class FaceStore:
                     lock_file.write(b"\0")
                     lock_file.flush()
                 lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                with timing.measure("vault_lock_wait"):
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
                 try:
                     yield
                 finally:
@@ -49,7 +51,8 @@ class FaceStore:
             else:
                 import fcntl
 
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                with timing.measure("vault_lock_wait"):
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
                 try:
                     yield
                 finally:
@@ -59,9 +62,11 @@ class FaceStore:
         if not self.path.exists():
             return {"version": 1, "templates": {}, "sessions": {}}
         try:
-            encrypted = self.path.read_bytes()
-            plaintext = self._cipher().decrypt(encrypted)
-            data = json.loads(plaintext)
+            with timing.measure("vault_disk_read"):
+                encrypted = self.path.read_bytes()
+            with timing.measure("vault_decrypt_json"):
+                plaintext = self._cipher().decrypt(encrypted)
+                data = json.loads(plaintext)
         except (OSError, InvalidToken, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise RuntimeError(
                 "The encrypted face store is unreadable. Restore its file and the matching ENCRYPTION_KEY."
@@ -76,22 +81,25 @@ class FaceStore:
         return data
 
     def _write_unlocked(self, data):
-        encrypted = self._cipher().encrypt(
-            json.dumps(data, separators=(",", ":"), allow_nan=False).encode("utf-8")
-        )
+        with timing.measure("vault_encrypt_json"):
+            encrypted = self._cipher().encrypt(
+                json.dumps(data, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            )
         temporary_path = None
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb", prefix=self.path.name + ".", suffix=".tmp",
-                dir=self.path.parent, delete=False,
-            ) as temporary:
-                temporary_path = Path(temporary.name)
-                temporary.write(encrypted)
-                temporary.flush()
-                os.fsync(temporary.fileno())
+            with timing.measure("vault_temp_write_fsync"):
+                with tempfile.NamedTemporaryFile(
+                    mode="wb", prefix=self.path.name + ".", suffix=".tmp",
+                    dir=self.path.parent, delete=False,
+                ) as temporary:
+                    temporary_path = Path(temporary.name)
+                    temporary.write(encrypted)
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
             if os.name != "nt":
                 temporary_path.chmod(0o600)
-            os.replace(temporary_path, self.path)
+            with timing.measure("vault_atomic_replace"):
+                os.replace(temporary_path, self.path)
             if os.name != "nt":
                 self.path.chmod(0o600)
         finally:
@@ -100,10 +108,11 @@ class FaceStore:
 
     @contextmanager
     def _edit(self):
-        with self._lock():
-            data = self._read_unlocked()
-            yield data
-            self._write_unlocked(data)
+        with timing.measure("vault_edit_total"):
+            with self._lock():
+                data = self._read_unlocked()
+                yield data
+                self._write_unlocked(data)
 
     def verify(self):
         with self._lock():
@@ -148,16 +157,18 @@ class FaceStore:
             }
 
     def get_session(self, session_id):
-        with self._lock():
-            session = self._read_unlocked()["sessions"].get(session_id)
+        with timing.measure("vault_session_read"):
+            with self._lock():
+                session = self._read_unlocked()["sessions"].get(session_id)
         return FaceEnrollmentSession(self, session_id, session) if session is not None else None
 
     def update_session(self, session_id, changes):
-        with self._edit() as data:
-            session = data["sessions"].get(session_id)
-            if session is None:
-                raise RuntimeError("The face enrollment session no longer exists.")
-            session.update(changes)
+        with timing.measure("vault_session_write"):
+            with self._edit() as data:
+                session = data["sessions"].get(session_id)
+                if session is None:
+                    raise RuntimeError("The face enrollment session no longer exists.")
+                session.update(changes)
 
     def delete_session(self, session_id):
         with self._edit() as data:
@@ -198,17 +209,19 @@ class FaceStore:
         }
 
     def add_session_embedding(self, session_id, record):
-        with self._edit() as data:
-            session = data["sessions"].get(session_id)
-            if session is None:
-                raise RuntimeError("The face enrollment session no longer exists.")
-            session["embeddings"].append(
-                self._serialize_embedding(record, enrollment_session_id=session_id)
-            )
+        with timing.measure("vault_session_write"):
+            with self._edit() as data:
+                session = data["sessions"].get(session_id)
+                if session is None:
+                    raise RuntimeError("The face enrollment session no longer exists.")
+                session["embeddings"].append(
+                    self._serialize_embedding(record, enrollment_session_id=session_id)
+                )
 
     def list_session_embeddings(self, session_id, student_id=None, pose=None):
-        with self._lock():
-            data = self._read_unlocked()
+        with timing.measure("vault_embedding_read"):
+            with self._lock():
+                data = self._read_unlocked()
         session = data["sessions"].get(session_id)
         if session is None or (
             student_id is not None and session["student_id"] != student_id
@@ -314,11 +327,13 @@ class FaceEnrollmentSession:
 
     @property
     def state_json(self):
-        return json.dumps(self._state)
+        with timing.measure("session_state_serialize"):
+            return json.dumps(self._state)
 
     @state_json.setter
     def state_json(self, value):
-        self._state = json.loads(value)
+        with timing.measure("session_state_deserialize"):
+            self._state = json.loads(value)
         self._store.update_session(self.id, {"state": self._state})
 
     @property
