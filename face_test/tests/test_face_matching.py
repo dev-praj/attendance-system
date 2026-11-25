@@ -163,5 +163,28 @@ class SharedEmbeddingPipelineTests(unittest.TestCase):
         self.assertAlmostEqual(float(np.linalg.norm(result)), 1.0, places=6)
 
 
+class CameraPortabilityTests(unittest.TestCase):
+    def test_platform_backend_order_includes_default_fallback(self):
+        self.assertEqual(
+            core.camera_backend_order("Windows"),
+            [core.cv2.CAP_DSHOW, core.cv2.CAP_MSMF, None],
+        )
+        self.assertEqual(
+            core.camera_backend_order("Darwin"),
+            [core.cv2.CAP_AVFOUNDATION, None],
+        )
+        self.assertEqual(
+            core.camera_backend_order("Linux"),
+            [core.cv2.CAP_V4L2, None],
+        )
+        self.assertEqual(core.camera_backend_order("Other"), [None])
+
+    def test_camera_failure_hint_is_specific_to_running_platform(self):
+        self.assertIn("Settings > Privacy > Camera", core.camera_access_hint("Windows"))
+        self.assertIn("macOS", core.camera_access_hint("Darwin"))
+        self.assertIn("/dev/video", core.camera_access_hint("Linux"))
+        self.assertNotIn("/dev/video", core.camera_access_hint("Windows"))
+
+
 if __name__ == "__main__":
     unittest.main()

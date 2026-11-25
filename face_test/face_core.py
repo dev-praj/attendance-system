@@ -385,25 +385,49 @@ def load_enrollments():
     return enrollments
 
 
+def camera_backend_order(system_name=None):
+    """Return preferred OpenCV camera backends followed by the default backend."""
+    operating_system = system_name or platform.system()
+    if operating_system == "Windows":
+        return [cv2.CAP_DSHOW, cv2.CAP_MSMF, None]
+    if operating_system == "Darwin":
+        return [cv2.CAP_AVFOUNDATION, None]
+    if operating_system == "Linux":
+        return [cv2.CAP_V4L2, None]
+    return [None]
+
+
+def camera_access_hint(system_name=None):
+    operating_system = system_name or platform.system()
+    if operating_system == "Windows":
+        return "Check Settings > Privacy > Camera and allow desktop-app camera access."
+    if operating_system == "Darwin":
+        return "Allow camera access for the terminal or app in macOS Privacy & Security settings."
+    if operating_system == "Linux":
+        return "Check camera permissions and available devices such as /dev/video*."
+    return "Check that a webcam is connected and that camera access is allowed."
+
+
 def open_camera():
-    if platform.system() == "Linux":
-        backend = cv2.CAP_V4L2
-    elif platform.system() == "Windows":
-        backend = cv2.CAP_DSHOW
-    else:
-        backend = cv2.CAP_ANY
     camera = None
     for index in range(4):
-        candidate = cv2.VideoCapture(index, backend)
-        if candidate.isOpened():
-            camera = candidate
+        for backend in camera_backend_order():
+            try:
+                candidate = (
+                    cv2.VideoCapture(index)
+                    if backend is None
+                    else cv2.VideoCapture(index, backend)
+                )
+            except cv2.error:
+                continue
+            if candidate.isOpened():
+                camera = candidate
+                break
+            candidate.release()
+        if camera is not None:
             break
-        candidate.release()
     if camera is None:
-        raise RuntimeError(
-            "Could not open camera indexes 0-3. On Linux check `ls /dev/video*` and camera "
-            "permissions; on Windows check camera privacy permissions."
-        )
+        raise RuntimeError(f"Could not open camera indexes 0-3. {camera_access_hint()}")
     try:
         camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -646,4 +670,3 @@ def letterbox_canvas(canvas, output_size):
     y0 = (output_height - fitted.shape[0]) // 2
     output[y0 : y0 + fitted.shape[0], x0 : x0 + fitted.shape[1]] = fitted
     return output
-
